@@ -702,6 +702,70 @@ app.use(function (req, res, next) {
             }
         });
 
+        // Export every monitor setting (plus notifications, proxies, tags) as plain JSON
+        socket.on("exportMonitors", async (includeSensitiveData, callback) => {
+            try {
+                checkLogin(socket);
+
+                const sensitive = includeSensitiveData === true;
+                log.info("monitor", `Export Monitors (sensitive: ${sensitive}) User ID: ${socket.userID}`);
+
+                const monitorList = await R.findAll("monitor", " ORDER BY weight DESC, name ");
+                const preloadData = await Monitor.preparePreloadData(
+                    monitorList.map((monitor) => ({ id: monitor.id, active: monitor.active, name: monitor.name }))
+                );
+
+                const notifications = (await R.find("notification")).map((bean) => {
+                    let config = {};
+                    try {
+                        config = JSON.parse(bean.config || "{}");
+                    } catch (e) {
+                        // keep empty config on invalid JSON
+                    }
+                    const item = {
+                        id: bean.id,
+                        name: bean.name,
+                        type: config.type ?? null,
+                        active: Boolean(bean.active),
+                        isDefault: Boolean(bean.is_default),
+                    };
+                    if (sensitive) {
+                        item.config = config;
+                    }
+                    return item;
+                });
+
+                const proxies = (await R.find("proxy")).map((bean) => {
+                    const item = bean.export();
+                    if (!sensitive) {
+                        delete item.password;
+                    }
+                    return item;
+                });
+
+                const tags = (await R.find("tag")).map((bean) => bean.export());
+
+                callback({
+                    ok: true,
+                    data: {
+                        exportedAt: new Date().toISOString(),
+                        version: checkVersion.version,
+                        includeSensitiveData: sensitive,
+                        monitors: monitorList.map((monitor) => monitor.toJSON(preloadData, sensitive)),
+                        notifications,
+                        proxies,
+                        tags,
+                    },
+                });
+            } catch (e) {
+                log.error("monitor", e);
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
         socket.on("getMonitor", async (monitorID, callback) => {
             try {
                 checkLogin(socket);
