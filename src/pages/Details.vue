@@ -117,10 +117,39 @@
 
             <div class="functions">
                 <div class="btn-group" role="group">
-                    <button v-if="monitor.active" class="btn btn-normal" @click="pauseDialog">
-                        <font-awesome-icon icon="pause" />
-                        {{ $t("Pause") }}
-                    </button>
+                    <div v-if="monitor.active" class="btn-group" role="group">
+                        <button class="btn btn-normal" @click="pauseDialog">
+                            <font-awesome-icon icon="pause" />
+                            {{ $t("Pause") }}
+                        </button>
+                        <button
+                            type="button"
+                            class="btn btn-normal dropdown-toggle dropdown-toggle-split"
+                            data-bs-toggle="dropdown"
+                            data-testid="pause-for-dropdown"
+                            :aria-label="$t('Pause for')"
+                            aria-expanded="false"
+                        >
+                            <span class="visually-hidden">{{ $t("Pause for") }}</span>
+                        </button>
+                        <ul class="dropdown-menu">
+                            <li v-for="option in pauseDurationOptionsLabeled" :key="option.seconds">
+                                <button
+                                    type="button"
+                                    class="dropdown-item"
+                                    @click="pauseMonitorFor(option.seconds)"
+                                >
+                                    {{ $t("Pause for") }} {{ option.label }}
+                                </button>
+                            </li>
+                            <li><hr class="dropdown-divider" /></li>
+                            <li>
+                                <button type="button" class="dropdown-item" @click="pauseDialog">
+                                    {{ $t("Pause indefinitely") }}
+                                </button>
+                            </li>
+                        </ul>
+                    </div>
                     <button
                         v-if="!monitor.active"
                         class="btn btn-primary"
@@ -143,6 +172,10 @@
                         {{ $t("Delete") }}
                     </button>
                 </div>
+                <p v-if="!monitor.active && monitor.pauseUntil" class="pause-until-info">
+                    {{ $t("Paused until") }}:
+                    <Datetime :value="monitor.pauseUntil" />
+                </p>
             </div>
 
             <div class="shadow-box">
@@ -500,6 +533,14 @@ export default {
             deleteChildrenMonitors: false,
             // Full monitor loaded on demand: the dashboard list only carries its summary fields
             fetchedMonitor: null,
+            pauseDurationOptions: [
+                { seconds: 10 * 60, labelKey: "minutes", count: 10 },
+                { seconds: 30 * 60, labelKey: "minutes", count: 30 },
+                { seconds: 60 * 60, labelKey: "hours", count: 1 },
+                { seconds: 2 * 60 * 60, labelKey: "hours", count: 2 },
+                { seconds: 6 * 60 * 60, labelKey: "hours", count: 6 },
+                { seconds: 24 * 60 * 60, labelKey: "hours", count: 24 },
+            ],
         };
     },
     computed: {
@@ -507,6 +548,17 @@ export default {
             // The dashboard list only carries the fields the list needs, so this page
             // renders nothing until the full monitor has been fetched
             return this.fetchedMonitor;
+        },
+
+        /**
+         * Localized labels for timed-pause presets
+         * @returns {{seconds: number, label: string}[]} Options
+         */
+        pauseDurationOptionsLabeled() {
+            return this.pauseDurationOptions.map((option) => ({
+                seconds: option.seconds,
+                label: this.$t(option.labelKey, option.count),
+            }));
         },
 
         /**
@@ -634,6 +686,7 @@ export default {
         this.fetchMonitor(this.$route.params.id);
 
         this.$root.emitter.on("newImportantHeartbeat", this.onNewImportantHeartbeat);
+        this.$root.getSocket()?.on("updateMonitorIntoList", this.onUpdateMonitorIntoList);
 
         if (this.monitor && this.monitor.type === "push") {
             if (this.lastHeartBeat.status === -1) {
@@ -645,6 +698,7 @@ export default {
 
     beforeUnmount() {
         this.$root.emitter.off("newImportantHeartbeat", this.onNewImportantHeartbeat);
+        this.$root.getSocket()?.off("updateMonitorIntoList", this.onUpdateMonitorIntoList);
     },
 
     methods: {
@@ -692,22 +746,52 @@ export default {
         resumeMonitor() {
             this.$root.getSocket().emit("resumeMonitor", this.monitor.id, (res) => {
                 if (res.ok) {
-                    this.setFetchedMonitorActive(true);
+                    this.setFetchedMonitorActive(true, null);
                 }
                 this.$root.toastRes(res);
             });
         },
 
         /**
-         * Request that this monitor is paused
+         * Request that this monitor is paused indefinitely
          * @returns {void}
          */
         pauseMonitor() {
-            this.$root.getSocket().emit("pauseMonitor", this.monitor.id, (res) => {
+            this.pauseMonitorFor(null);
+        },
+
+        /**
+         * Pause this monitor for an optional duration
+         * @param {number|null} durationSeconds Duration in seconds, or null for indefinite
+         * @returns {void}
+         */
+        pauseMonitorFor(durationSeconds) {
+            const args = [this.monitor.id];
+            if (durationSeconds != null) {
+                args.push(durationSeconds);
+            }
+            this.$root.getSocket().emit("pauseMonitor", ...args, (res) => {
                 if (res.ok) {
-                    this.setFetchedMonitorActive(false);
+                    this.refreshFetchedMonitor();
                 }
                 this.$root.toastRes(res);
+            });
+        },
+
+        /**
+         * Reload the full monitor without blanking the page
+         * @returns {void}
+         */
+        refreshFetchedMonitor() {
+            const id = this.$route.params.id;
+            const socket = this.$root.getSocket();
+            if (!socket) {
+                return;
+            }
+            socket.emit("getMonitor", id, (res) => {
+                if (res.ok && this.$route.params.id === id) {
+                    this.fetchedMonitor = res.monitor;
+                }
             });
         },
 
@@ -715,11 +799,34 @@ export default {
          * Keep the fetched (full) monitor in sync with an active-state change.
          * The dashboard list is a summary, so this page keeps its own copy.
          * @param {boolean} active New active state
+         * @param {string|null} [pauseUntil] Timed pause deadline
          * @returns {void}
          */
-        setFetchedMonitorActive(active) {
+        setFetchedMonitorActive(active, pauseUntil = null) {
             if (this.fetchedMonitor) {
                 this.fetchedMonitor.active = active;
+                this.fetchedMonitor.pauseUntil = pauseUntil;
+            }
+        },
+
+        /**
+         * Sync active/pauseUntil when the server pushes a list update (e.g. auto-resume)
+         * @param {object} data Updated monitors keyed by id
+         * @returns {void}
+         */
+        onUpdateMonitorIntoList(data) {
+            if (!this.fetchedMonitor || !data) {
+                return;
+            }
+            const updated = data[this.fetchedMonitor.id];
+            if (!updated) {
+                return;
+            }
+            if ("active" in updated) {
+                this.fetchedMonitor.active = updated.active;
+            }
+            if ("pauseUntil" in updated) {
+                this.fetchedMonitor.pauseUntil = updated.pauseUntil;
             }
         },
 
@@ -975,6 +1082,13 @@ export default {
     a {
         color: $primary;
     }
+}
+
+.pause-until-info {
+    margin-top: 10px;
+    margin-bottom: 0;
+    color: $secondary-text;
+    font-size: 0.9em;
 }
 
 .shadow-box {

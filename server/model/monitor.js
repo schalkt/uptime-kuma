@@ -148,6 +148,7 @@ class Monitor extends BeanModel {
             weight: this.weight,
             active: preloadData.activeStatus.get(this.id),
             forceInactive: preloadData.forceInactive.get(this.id),
+            pauseUntil: this.pause_until || null,
             type: this.type,
             subtype: this.subtype,
             timeout: this.timeout,

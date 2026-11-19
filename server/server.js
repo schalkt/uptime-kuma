@@ -148,6 +148,12 @@ const {
 const { UptimeCalculator } = require("./uptime-calculator");
 const { MonitorStats } = require("./monitor-stats");
 const { socketRoom } = require("./heartbeat-emit");
+const {
+    clearPauseUntilTimer,
+    schedulePauseUntil,
+    normalizePauseDuration,
+} = require("./pause-until");
+const dayjs = require("dayjs");
 
 const hostname = config.hostname;
 
@@ -811,18 +817,28 @@ app.use(function (req, res, next) {
             }
         });
 
-        socket.on("pauseMonitor", async (monitorID, callback) => {
+        socket.on("pauseMonitor", async (monitorID, durationOrCallback, maybeCallback) => {
             try {
                 checkLogin(socket);
-                await pauseMonitor(socket.userID, monitorID);
+
+                // Backward compatible: pauseMonitor(id, cb) or pauseMonitor(id, durationSeconds, cb)
+                let durationSeconds = null;
+                let callback = durationOrCallback;
+                if (typeof durationOrCallback !== "function") {
+                    durationSeconds = durationOrCallback;
+                    callback = maybeCallback;
+                }
+
+                await pauseMonitor(socket.userID, monitorID, durationSeconds);
                 await server.sendUpdateMonitorIntoList(socket, monitorID);
 
                 callback({
                     ok: true,
-                    msg: "successPaused",
+                    msg: durationSeconds ? "successPausedUntil" : "successPaused",
                     msgi18n: true,
                 });
             } catch (e) {
+                const callback = typeof durationOrCallback === "function" ? durationOrCallback : maybeCallback;
                 callback({
                     ok: false,
                     msg: e.message,
@@ -1455,6 +1471,7 @@ app.use(function (req, res, next) {
         printServerUrls("server", port, hostname, config.isSSL);
 
         await startMonitors();
+        await restorePauseUntilTimers();
 
         // Warm the dashboard/prometheus stats cache once, then refresh it periodically.
         // Without this, every beat would load years of stat rows per monitor.
@@ -1587,7 +1604,8 @@ async function initDatabase(testMode = false) {
 async function startMonitor(userID, monitorID) {
     log.info("manage", `Resume Monitor: ${monitorID} User ID: ${userID}`);
 
-    await R.exec("UPDATE monitor SET active = 1 WHERE id = ? ", [monitorID]);
+    clearPauseUntilTimer(monitorID);
+    await R.exec("UPDATE monitor SET active = 1, pause_until = NULL WHERE id = ? ", [monitorID]);
 
     let monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
 
@@ -1610,19 +1628,64 @@ async function restartMonitor(userID, monitorID) {
 }
 
 /**
- * Pause a given monitor
+ * Pause a given monitor, optionally until a deadline.
  * @param {number} userID ID of user who owns monitor
- * @param {number} monitorID ID of monitor to start
+ * @param {number} monitorID ID of monitor to pause
+ * @param {number|null} [durationSeconds] Optional pause duration in seconds
  * @returns {Promise<void>}
  */
-async function pauseMonitor(userID, monitorID) {
-    log.info("manage", `Pause Monitor: ${monitorID} User ID: ${userID}`);
+async function pauseMonitor(userID, monitorID, durationSeconds = null) {
+    const duration = normalizePauseDuration(durationSeconds);
+    const pauseUntil = duration ? dayjs().add(duration, "second").toISOString() : null;
 
-    await R.exec("UPDATE monitor SET active = 0 WHERE id = ? ", [monitorID]);
+    log.info(
+        "manage",
+        `Pause Monitor: ${monitorID} User ID: ${userID}` + (pauseUntil ? ` until ${pauseUntil}` : "")
+    );
+
+    clearPauseUntilTimer(monitorID);
+    await R.exec("UPDATE monitor SET active = 0, pause_until = ? WHERE id = ? ", [pauseUntil, monitorID]);
 
     if (monitorID in server.monitorList) {
         await server.monitorList[monitorID].stop();
         server.monitorList[monitorID].active = 0;
+        server.monitorList[monitorID].pause_until = pauseUntil;
+    }
+
+    if (pauseUntil) {
+        schedulePauseUntil(monitorID, pauseUntil, autoResumeMonitor);
+    }
+}
+
+/**
+ * Auto-resume a monitor after a timed pause and notify the owner's sockets.
+ * @param {number} monitorID Monitor ID
+ * @returns {Promise<void>}
+ */
+async function autoResumeMonitor(monitorID) {
+    const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
+    if (!monitor || monitor.active === 1) {
+        clearPauseUntilTimer(monitorID);
+        return;
+    }
+
+    log.info("manage", `Auto-resume Monitor: ${monitorID} User ID: ${monitor.user_id}`);
+    await startMonitor(monitor.user_id, monitorID);
+
+    const list = await server.getMonitorJSONList(monitorID);
+    if (list && list[monitorID]) {
+        io.to(monitor.user_id).emit("updateMonitorIntoList", list);
+    }
+}
+
+/**
+ * Re-schedule timed pauses after server restart.
+ * @returns {Promise<void>}
+ */
+async function restorePauseUntilTimers() {
+    const list = await R.find("monitor", " active = 0 AND pause_until IS NOT NULL ");
+    for (const monitor of list) {
+        schedulePauseUntil(monitor.id, monitor.pause_until, autoResumeMonitor);
     }
 }
 
